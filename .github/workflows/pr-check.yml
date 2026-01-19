@@ -31,21 +31,52 @@ jobs:
           COMMIT_COUNT=$(git rev-list --count origin/${{ github.event.pull_request.base.ref }}..origin/${{ github.event.pull_request.head.ref }})
           echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
           
-          # 변경 라인 수 계산
+          # 전체 변경 라인 수 계산
           git diff origin/${{ github.event.pull_request.base.ref }}...origin/${{ github.event.pull_request.head.ref }} --shortstat > diff_stat.txt
-          CHANGED_LINES=$(awk '{print $4+$6}' diff_stat.txt)
-          echo "changed_lines=${CHANGED_LINES:-0}" >> $GITHUB_OUTPUT
+          TOTAL_CHANGED_LINES=$(awk '{print $4+$6}' diff_stat.txt)
+          echo "total_changed_lines=${TOTAL_CHANGED_LINES:-0}" >> $GITHUB_OUTPUT
+          
+          # 변경된 파일 목록
+          git diff --name-only origin/${{ github.event.pull_request.base.ref }}...origin/${{ github.event.pull_request.head.ref }} > changed_files.txt
+          
+          # 테스트 파일 제외한 변경 라인 수 계산
+          NON_TEST_LINES=0
+          TEST_LINES=0
+          
+          while IFS= read -r file; do
+            # 테스트 파일인지 확인 (대소문자 구분 없이)
+            if echo "$file" | grep -qiE '(test|spec|__tests__|__mocks__)'; then
+              # 테스트 파일의 변경 라인 수
+              FILE_CHANGES=$(git diff origin/${{ github.event.pull_request.base.ref }}...origin/${{ github.event.pull_request.head.ref }} -- "$file" | grep -E '^[+-]' | grep -vE '^(---|\+\+\+)' | wc -l)
+              TEST_LINES=$((TEST_LINES + FILE_CHANGES))
+            else
+              # 일반 파일의 변경 라인 수
+              FILE_CHANGES=$(git diff origin/${{ github.event.pull_request.base.ref }}...origin/${{ github.event.pull_request.head.ref }} -- "$file" | grep -E '^[+-]' | grep -vE '^(---|\+\+\+)' | wc -l)
+              NON_TEST_LINES=$((NON_TEST_LINES + FILE_CHANGES))
+            fi
+          done < changed_files.txt
+          
+          echo "non_test_changed_lines=$NON_TEST_LINES" >> $GITHUB_OUTPUT
+          echo "test_changed_lines=$TEST_LINES" >> $GITHUB_OUTPUT
           
           # 테스트 파일 존재 여부
-          TEST_FILES=$(git diff --name-only origin/${{ github.event.pull_request.base.ref }}...origin/${{ github.event.pull_request.head.ref }} | grep -iE '(test|spec)' | wc -l)
-          echo "has_tests=$([[ $TEST_FILES -gt 0 ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          TEST_FILE_COUNT=$(cat changed_files.txt | grep -iE '(test|spec|__tests__|__mocks__)' | wc -l)
+          echo "has_tests=$([[ $TEST_FILE_COUNT -gt 0 ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          
+          echo "=== PR Statistics ==="
+          echo "Total changed lines: $TOTAL_CHANGED_LINES"
+          echo "Non-test changed lines: $NON_TEST_LINES"
+          echo "Test changed lines: $TEST_LINES"
+          echo "Has test files: $([[ $TEST_FILE_COUNT -gt 0 ]] && echo 'true' || echo 'false')"
 
       - name: Validate PR Rules
         uses: actions/github-script@v7
         with:
           script: |
             const commitCount = parseInt('${{ steps.pr-info.outputs.commit_count }}');
-            const changedLines = parseInt('${{ steps.pr-info.outputs.changed_lines }}');
+            const totalChangedLines = parseInt('${{ steps.pr-info.outputs.total_changed_lines }}');
+            const nonTestChangedLines = parseInt('${{ steps.pr-info.outputs.non_test_changed_lines }}');
+            const testChangedLines = parseInt('${{ steps.pr-info.outputs.test_changed_lines }}');
             const hasTests = '${{ steps.pr-info.outputs.has_tests }}' === 'true';
             const pr = context.payload.pull_request;
             const prBody = pr.body || '';
@@ -53,7 +84,9 @@ jobs:
             console.log('PR Info:', {
               number: pr.number,
               commitCount,
-              changedLines,
+              totalChangedLines,
+              nonTestChangedLines,
+              testChangedLines,
               hasTests,
               prBodyLength: prBody.length
             });
@@ -73,18 +106,25 @@ jobs:
             }
             checks.push(`커밋 개수: ${commitCount}개 (최대 ${MAX_COMMITS}개)`);
             
-            // 2. 변경 라인 수 검증
-            const maxLines = hasTests ? 500 : 200;
-            if (changedLines > maxLines) {
+            // 2. 변경 라인 수 검증 (테스트 코드 제외)
+            const MAX_NON_TEST_LINES = 200;
+            const MAX_TEST_LINES = 500;
+            
+            if (nonTestChangedLines > MAX_NON_TEST_LINES) {
               violations.push({
                 category: 'Pull Request 크기 규칙',
-                message: `**변경 라인 수 초과**: 현재 ${changedLines}줄 (테스트 코드 ${hasTests ? '포함' : '미포함'}, 최대 허용: ${maxLines}줄)`,
-                detail: hasTests 
-                  ? 'PR을 더 작은 단위로 분리해주세요' 
-                  : 'PR을 더 작은 단위로 분리하거나 테스트 코드를 추가해주세요'
+                message: `**변경 라인 수 초과**: 현재 ${nonTestChangedLines}줄 (테스트 코드 제외, 최대 허용: ${MAX_NON_TEST_LINES}줄)`,
+                detail: 'PR을 더 작은 단위로 분리해주세요'
               });
             }
-            checks.push(`변경 라인 수: ${changedLines}줄 (테스트 코드 ${hasTests ? '포함' : '미포함'}, 최대 ${maxLines}줄)`);
+            
+            // 상세 정보 표시
+            if (hasTests) {
+              checks.push(`변경 라인 수: ${nonTestChangedLines}줄 (테스트 코드 제외, 최대 ${MAX_NON_TEST_LINES}줄)`);
+              checks.push(`테스트 코드: ${testChangedLines}줄 (최대 ${MAX_TEST_LINES}줄, 참고용)`);
+            } else {
+              checks.push(`변경 라인 수: ${nonTestChangedLines}줄 (테스트 코드 없음, 최대 ${MAX_NON_TEST_LINES}줄)`);
+            }
             
             // 3. 연결된 카드/이슈 개수 검증
             const issueMatches = prBody.match(/#\d+/g) || [];
@@ -104,14 +144,6 @@ jobs:
             
             // 4. PR Description 필수 섹션 검증
             const requiredSections = [
-              { 
-                name: '변경 사항 요약', 
-                patterns: [/##?\s*변경\s*사항\s*요약/i, /##?\s*change\s*summary/i, /##?\s*summary/i] 
-              },
-              { 
-                name: '변경 이유 / 배경', 
-                patterns: [/##?\s*(변경\s*이유|배경|reason|background)/i] 
-              },
               { 
                 name: '테스트 방법', 
                 patterns: [/##?\s*테스트\s*방법/i, /##?\s*test\s*method/i, /##?\s*testing/i] 
@@ -168,7 +200,7 @@ jobs:
             if (violations.length > 0) {
               // 위반 사항이 있는 경우
               validationResult = `<!-- PR_RULE_VALIDATION_START -->
-            ## 🤖 PR 규칙 검증 결과
+            ##  PR 규칙 검증 결과
             
             ### ❌ 규칙 위반 (${violations.length}개)
             
@@ -193,7 +225,7 @@ jobs:
             
               validationResult += `---
             
-            ### 📋 위반 상세
+            ###  위반 상세
             
             `;
             
@@ -266,3 +298,5 @@ jobs:
             
             console.log('PR description updated successfully');
             console.log('Violations found:', violations.length);
+            console.log('Non-test lines:', nonTestChangedLines);
+            console.log('Test lines:', testChangedLines);
