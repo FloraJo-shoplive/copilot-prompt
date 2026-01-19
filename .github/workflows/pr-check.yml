@@ -1,0 +1,264 @@
+# .github/workflows/pr-rule-validation.yml
+name: PR Rule Validation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR information
+        id: pr-info
+        run: |
+          # PR 기본 정보
+          echo "pr_number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+          echo "base_ref=${{ github.event.pull_request.base.ref }}" >> $GITHUB_OUTPUT
+          echo "head_ref=${{ github.event.pull_request.head.ref }}" >> $GITHUB_OUTPUT
+          
+          # 커밋 개수 계산
+          COMMIT_COUNT=$(git rev-list --count origin/${{ github.event.pull_request.base.ref }}..origin/${{ github.event.pull_request.head.ref }})
+          echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
+          
+          # 변경 라인 수 계산
+          git diff origin/${{ github.event.pull_request.base.ref }}...origin/${{ github.event.pull_request.head.ref }} --shortstat > diff_stat.txt
+          CHANGED_LINES=$(awk '{print $4+$6}' diff_stat.txt)
+          echo "changed_lines=${CHANGED_LINES:-0}" >> $GITHUB_OUTPUT
+          
+          # 테스트 파일 존재 여부
+          TEST_FILES=$(git diff --name-only origin/${{ github.event.pull_request.base.ref }}...origin/${{ github.event.pull_request.head.ref }} | grep -iE '(test|spec)' | wc -l)
+          echo "has_tests=$([[ $TEST_FILES -gt 0 ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          
+          # 연결된 이슈 개수 (PR body에서 계산)
+          echo "pr_body<<EOF" >> $GITHUB_OUTPUT
+          echo "${{ github.event.pull_request.body }}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Validate PR Rules
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const commitCount = parseInt('${{ steps.pr-info.outputs.commit_count }}');
+            const changedLines = parseInt('${{ steps.pr-info.outputs.changed_lines }}');
+            const hasTests = '${{ steps.pr-info.outputs.has_tests }}' === 'true';
+            const prBody = `${{ steps.pr-info.outputs.pr_body }}`;
+            const pr = context.payload.pull_request;
+            
+            console.log('PR Info:', {
+              number: pr.number,
+              commitCount,
+              changedLines,
+              hasTests,
+              prBodyLength: prBody.length
+            });
+            
+            // 검증 결과 저장
+            const violations = [];
+            const checks = [];
+            
+            // 1. 커밋 개수 검증
+            const MAX_COMMITS = 3;
+            if (commitCount > MAX_COMMITS) {
+              violations.push({
+                category: 'Pull Request 크기 규칙',
+                message: `**커밋 개수 초과**: 현재 ${commitCount}개 (최대 허용: ${MAX_COMMITS}개)`,
+                detail: '커밋을 3개 이하로 squash 해주세요'
+              });
+            }
+            checks.push(`커밋 개수: ${commitCount}개 (최대 ${MAX_COMMITS}개)`);
+            
+            // 2. 변경 라인 수 검증
+            const maxLines = hasTests ? 500 : 200;
+            if (changedLines > maxLines) {
+              violations.push({
+                category: 'Pull Request 크기 규칙',
+                message: `**변경 라인 수 초과**: 현재 ${changedLines}줄 (테스트 코드 ${hasTests ? '포함' : '미포함'}, 최대 허용: ${maxLines}줄)`,
+                detail: hasTests 
+                  ? 'PR을 더 작은 단위로 분리해주세요' 
+                  : 'PR을 더 작은 단위로 분리하거나 테스트 코드를 추가해주세요'
+              });
+            }
+            checks.push(`변경 라인 수: ${changedLines}줄 (테스트 코드 ${hasTests ? '포함' : '미포함'}, 최대 ${maxLines}줄)`);
+            
+            // 3. 연결된 카드/이슈 개수 검증
+            const issueMatches = prBody.match(/#\d+/g) || [];
+            const closesMatches = prBody.match(/closes\s+#\d+/gi) || [];
+            const linkedIssues = new Set([...issueMatches, ...closesMatches.map(m => m.match(/#\d+/)[0])]);
+            const linkedCount = linkedIssues.size;
+            
+            const MAX_LINKED = 1;
+            if (linkedCount > MAX_LINKED) {
+              violations.push({
+                category: 'Pull Request 크기 규칙',
+                message: `**연결된 카드 초과**: 현재 ${linkedCount}개 (최대 허용: ${MAX_LINKED}개)`,
+                detail: 'PR을 분리하여 각각 하나의 이슈에만 연결해주세요'
+              });
+            }
+            checks.push(`연결된 카드: ${linkedCount}개 (최대 ${MAX_LINKED}개)`);
+            
+            // 4. PR Description 필수 섹션 검증
+            const requiredSections = [
+              { name: '변경 사항 요약', patterns: [/##?\s*변경\s*사항\s*요약/i, /##?\s*change\s*summary/i, /##?\s*summary/i] },
+              { name: '변경 이유 / 배경', patterns: [/##?\s*(변경\s*이유|배경|reason|background)/i] },
+              { name: '테스트 방법', patterns: [/##?\s*테스트\s*방법/i, /##?\s*test\s*method/i, /##?\s*testing/i] }
+            ];
+            
+            const missingSections = [];
+            const foundSections = [];
+            
+            for (const section of requiredSections) {
+              const found = section.patterns.some(pattern => pattern.test(prBody));
+              if (found) {
+                foundSections.push(section.name);
+              } else {
+                // 테스트 방법 예외 확인
+                if (section.name === '테스트 방법') {
+                  // 테스트 코드가 있거나, rename-only refactoring인지 확인
+                  const isRenameOnly = /rename|리네임|이름\s*변경/i.test(prBody) && 
+                                       !/기능|feature|추가|add|수정|modify|변경|change/i.test(prBody);
+            
+                  if (!hasTests && !isRenameOnly) {
+                    missingSections.push(section.name);
+                  } else if (hasTests || isRenameOnly) {
+                    foundSections.push(`${section.name} (${hasTests ? '테스트 코드로 대체' : '예외 적용'})`);
+                  }
+                } else {
+                  // 카드 링크로 대체 가능
+                  if (linkedCount === 0) {
+                    missingSections.push(section.name);
+                  } else {
+                    foundSections.push(`${section.name} (카드 링크로 대체 가능)`);
+                  }
+                }
+              }
+            }
+            
+            // 누락된 섹션이 있으면 위반 추가
+            if (missingSections.length > 0) {
+              for (const section of missingSections) {
+                violations.push({
+                  category: 'Pull Request 설명 규칙',
+                  message: `**필수 섹션 누락**: "${section}" 섹션이 없습니다`,
+                  detail: section === '테스트 방법' 
+                    ? '변경 사항을 어떻게 테스트했는지 설명을 추가하거나 테스트 코드를 포함해주세요'
+                    : `"${section}" 섹션을 추가하거나 관련 카드를 링크해주세요`
+                });
+              }
+            }
+            
+            // 검증 결과 생성
+            const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+            let validationResult = '';
+            
+            if (violations.length > 0) {
+              // 위반 사항이 있는 경우
+              validationResult = `<!-- PR_RULE_VALIDATION_START -->
+## 🤖 PR 규칙 검증 결과
+
+### ❌ 규칙 위반 (${violations.length}개)
+
+  `;
+  
+  // 카테고리별로 그룹화
+  const violationsByCategory = violations.reduce((acc, v) => {
+  if (!acc[v.category]) acc[v.category] = [];
+  acc[v.category].push(v);
+  return acc;
+  }, {});
+  
+  let categoryIndex = 1;
+  for (const [category, items] of Object.entries(violationsByCategory)) {
+  validationResult += `#### ${categoryIndex}. ${category}\n`;
+  for (const item of items) {
+  validationResult += `- ❌ ${item.message}\n`;
+  }
+  validationResult += '\n';
+  categoryIndex++;
+  }
+  
+  validationResult += `---
+  
+  ### 📋 위반 상세
+  
+  `;
+  
+  let detailIndex = 1;
+  for (const violation of violations) {
+  validationResult += `${detailIndex}. ${violation.detail}\n`;
+  detailIndex++;
+  }
+  
+  validationResult += `
+---
+  *마지막 검증: ${timestamp}*
+  <!-- PR_RULE_VALIDATION_END -->`;
+
+  } else {
+  // 위반 사항이 없는 경우
+  validationResult = `<!-- PR_RULE_VALIDATION_START -->
+  ## 🤖 PR 규칙 검증 결과
+  
+  ### ✅ 모든 규칙 준수
+  
+  이 Pull Request는 정의된 모든 PR 규칙을 준수합니다.
+  
+  #### 검증 항목
+  `;
+  
+  for (const check of checks) {
+  validationResult += `- ✅ ${check}\n`;
+  }
+
+  if (foundSections.length > 0) {
+       validationResult += `- ✅ 필수 섹션: 모두 작성됨\n`;
+  for (const section of foundSections) {
+  validationResult += `  - ${section} ✓\n`;
+}
+}
+
+  validationResult += `
+---
+  *마지막 검증: ${timestamp}*
+  <!-- PR_RULE_VALIDATION_END -->`;
+  }
+
+  console.log('Validation Result:', validationResult);
+  
+  // 기존 PR Description에서 검증 결과 제거
+  let newBody = pr.body || '';
+  const startMarker = '<!-- PR_RULE_VALIDATION_START -->';
+  const endMarker = '<!-- PR_RULE_VALIDATION_END -->';
+  
+  const startIndex = newBody.indexOf(startMarker);
+  const endIndex = newBody.indexOf(endMarker);
+  
+  if (startIndex !== -1 && endIndex !== -1) {
+  // 기존 검증 결과 제거
+  newBody = newBody.substring(0, startIndex) +
+  newBody.substring(endIndex + endMarker.length);
+  }
+
+  // 새 검증 결과를 맨 위에 추가
+  newBody = validationResult + '\n\n---\n\n' + newBody.trim();
+  
+  // PR Description 업데이트
+  await github.rest.pulls.update({
+       owner: context.repo.owner,
+       repo: context.repo.repo,
+       pull_number: pr.number,
+       body: newBody
+});
+  
+  console.log('PR description updated successfully');
+  console.log('Violations found:', violations.length);
