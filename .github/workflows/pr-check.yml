@@ -146,7 +146,7 @@ jobs:
               violations.push({
                 category: 'Pull Request 크기 규칙',
                 message: `**연결된 카드 없음**: 현재 ${linkedCount}개 (최소 허용: ${MIN_LINKED}개)`,
-                detail: 'PR을 분리하여 각각 하나의 이슈에만 연결해주세요'
+                detail: 'PR에 연결된 카드가 없습니다.'
               });
             }
             checks.push(`연결된 카드: ${linkedCount}개 (최대 ${MAX_LINKED}개)`);
