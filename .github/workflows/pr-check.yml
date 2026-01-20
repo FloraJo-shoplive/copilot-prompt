@@ -3,7 +3,7 @@ name: PR Rule Validation
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, edited]
 
 permissions:
   contents: read
@@ -49,9 +49,13 @@ jobs:
           # 변경된 파일 목록
           git diff --name-only origin/${{ github.event.pull_request.base.ref }}...origin/${{ github.event.pull_request.head.ref }} > changed_files.txt
           
-          # 테스트 파일 제외한 변경 라인 수 계산
+          # 테스트 파일 제외한 변경 라인 수 계산 + 120자 초과 라인 검사
           NON_TEST_LINES=0
           TEST_LINES=0
+          LONG_LINES_COUNT=0
+          
+          # 120자 초과 라인 상세 정보 저장
+          > long_lines_detail.txt
           
           while IFS= read -r file; do
             # 테스트 파일인지 확인 (대소문자 구분 없이)
@@ -63,11 +67,27 @@ jobs:
               # 일반 파일의 변경 라인 수
               FILE_CHANGES=$(git diff origin/${{ github.event.pull_request.base.ref }}...origin/${{ github.event.pull_request.head.ref }} -- "$file" | grep -E '^[+-]' | grep -vE '^(---|\+\+\+)' | wc -l)
               NON_TEST_LINES=$((NON_TEST_LINES + FILE_CHANGES))
+          
+              # 120자 초과 라인 검사 (추가된 라인만, + 기호 제외하고 계산)
+              git diff origin/${{ github.event.pull_request.base.ref }}...origin/${{ github.event.pull_request.head.ref }} -U0 -- "$file" | \
+                awk '/^\+/ && !/^\+\+\+/ {
+                  line = substr($0, 2);  # + 기호 제거
+                  if (length(line) > 120) {
+                    print FILENAME ":" NR ":" length(line) ":" line;
+                    count++;
+                  }
+                } END {
+                  if (count > 0) print "FILE_TOTAL:" count;
+                }' FILENAME="$file" >> long_lines_detail.txt
             fi
           done < changed_files.txt
           
+          # 120자 초과 라인 총 개수 계산
+          LONG_LINES_COUNT=$(grep -c "^.*:.*:.*:.*" long_lines_detail.txt || echo "0")
+          
           echo "non_test_changed_lines=$NON_TEST_LINES" >> $GITHUB_OUTPUT
           echo "test_changed_lines=$TEST_LINES" >> $GITHUB_OUTPUT
+          echo "long_lines_count=$LONG_LINES_COUNT" >> $GITHUB_OUTPUT
           
           # 테스트 파일 존재 여부
           TEST_FILE_COUNT=$(cat changed_files.txt | grep -iE '(test|spec|__tests__|__mocks__)' | wc -l)
@@ -79,6 +99,7 @@ jobs:
           echo "Test changed lines: $TEST_LINES"
           echo "Has test files: $([[ $TEST_FILE_COUNT -gt 0 ]] && echo 'true' || echo 'false')"
           echo "Commit linked issues: $COMMIT_ISSUES"
+          echo "Long lines (>120 chars): $LONG_LINES_COUNT"
           echo "Found issue keys:"
           cat commit_issue_keys.txt || echo "None"
 
@@ -86,15 +107,40 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            const fs = require('fs');
+            
             const commitCount = parseInt('${{ steps.pr-info.outputs.commit_count }}');
             const totalChangedLines = parseInt('${{ steps.pr-info.outputs.total_changed_lines }}');
             const nonTestChangedLines = parseInt('${{ steps.pr-info.outputs.non_test_changed_lines }}');
             const testChangedLines = parseInt('${{ steps.pr-info.outputs.test_changed_lines }}');
             const hasTests = '${{ steps.pr-info.outputs.has_tests }}' === 'true';
             const commitLinkedIssues = parseInt('${{ steps.pr-info.outputs.commit_linked_issues }}');
+            const longLinesCount = parseInt('${{ steps.pr-info.outputs.long_lines_count }}');
             const pr = context.payload.pull_request;
             const prBody = pr.body || '';
             const prTitle = pr.title || '';
+            
+            // 120자 초과 라인 상세 정보 읽기
+            let longLinesDetails = [];
+            try {
+              const longLinesContent = fs.readFileSync('long_lines_detail.txt', 'utf8');
+              const lines = longLinesContent.split('\n').filter(line => line.includes(':'));
+            
+              longLinesDetails = lines.map(line => {
+                const parts = line.split(':');
+                if (parts.length >= 4) {
+                  return {
+                    file: parts[0],
+                    lineNumber: parts[1],
+                    length: parseInt(parts[2]),
+                    content: parts.slice(3).join(':').substring(0, 100) // 처음 100자만
+                  };
+                }
+                return null;
+              }).filter(item => item !== null);
+            } catch (error) {
+              console.log('No long lines detail file found');
+            }
             
             console.log('PR Info:', {
               number: pr.number,
@@ -105,6 +151,7 @@ jobs:
               testChangedLines,
               hasTests,
               commitLinkedIssues,
+              longLinesCount,
               prBodyLength: prBody.length
             });
             
@@ -138,10 +185,33 @@ jobs:
             // 상세 정보 표시
             if (hasTests) {
               checks.push(`변경 라인 수: ${nonTestChangedLines}줄 (테스트 코드 제외, 최대 ${MAX_NON_TEST_LINES}줄)`);
-              checks.push(`테스트 코드: ${testChangedLines}줄;
+              checks.push(`테스트 코드: ${testChangedLines}줄 (최대 ${MAX_TEST_LINES}줄, 참고용)`);
             } else {
               checks.push(`변경 라인 수: ${nonTestChangedLines}줄 (테스트 코드 없음, 최대 ${MAX_NON_TEST_LINES}줄)`);
             }
+            
+            // 2-1. 라인 길이 검증 (120자 초과)
+            const MAX_LINE_LENGTH = 120;
+            if (longLinesCount > 0) {
+              // 상위 5개만 표시
+              const topViolations = longLinesDetails.slice(0, 5);
+              let detailMessage = `다음 ${topViolations.length}개 라인이 ${MAX_LINE_LENGTH}자를 초과합니다:\n`;
+            
+              topViolations.forEach((item, index) => {
+                detailMessage += `  ${index + 1}. \`${item.file}\` 라인 ${item.lineNumber}: ${item.length}자\n`;
+              });
+            
+              if (longLinesCount > 5) {
+                detailMessage += `  ... 외 ${longLinesCount - 5}개 라인\n`;
+              }
+            
+              violations.push({
+                category: '코드 스타일 규칙',
+                message: `**라인 길이 초과**: ${longLinesCount}개 라인이 ${MAX_LINE_LENGTH}자를 초과합니다`,
+                detail: detailMessage.trim()
+              });
+            }
+            checks.push(`라인 길이: ${longLinesCount}개 라인이 ${MAX_LINE_LENGTH}자 초과 (권장: 0개)`);
             
             // 3. 연결된 카드/이슈 개수 검증 (Jira 스타일: PROD-1, CO-2 등)
             // PR Title에서 이슈 키 추출
@@ -360,6 +430,4 @@ jobs:
             console.log('Violations found:', violations.length);
             console.log('Non-test lines:', nonTestChangedLines);
             console.log('Test lines:', testChangedLines);
-            console.log('PR linked issues:', prLinkedCount);
-            console.log('Commit linked issues:', commitLinkedIssues);
-            console.log('Total linked issues:', totalLinkedCount);
+            console.log('Long lines:', longLinesCount);
