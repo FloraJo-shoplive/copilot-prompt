@@ -68,22 +68,24 @@ jobs:
               FILE_CHANGES=$(git diff origin/${{ github.event.pull_request.base.ref }}...origin/${{ github.event.pull_request.head.ref }} -- "$file" | grep -E '^[+-]' | grep -vE '^(---|\+\+\+)' | wc -l)
               NON_TEST_LINES=$((NON_TEST_LINES + FILE_CHANGES))
           
-              # 120자 초과 라인 검사 (추가된 라인만, + 기호 제외하고 계산)
-              git diff origin/${{ github.event.pull_request.base.ref }}...origin/${{ github.event.pull_request.head.ref }} -U0 -- "$file" | \
-                awk '/^\+/ && !/^\+\+\+/ {
-                  line = substr($0, 2);  # + 기호 제거
-                  if (length(line) > 120) {
-                    print FILENAME ":" NR ":" length(line) ":" line;
-                    count++;
-                  }
-                } END {
-                  if (count > 0) print "FILE_TOTAL:" count;
-                }' FILENAME="$file" >> long_lines_detail.txt
+              # 120자 초과 라인 검사 (추가된 라인만)
+              git diff origin/${{ github.event.pull_request.base.ref }}...origin/${{ github.event.pull_request.head.ref }} -- "$file" | \
+                grep -n "^\+" | grep -v "^\+\+\+" | while IFS=: read -r line_num line_content; do
+                  # + 기호 제거
+                  actual_content="${line_content:1}"
+                  line_length=${#actual_content}
+          
+                  if [ "$line_length" -gt 120 ]; then
+                    # 파일명:라인번호:길이:내용 형식으로 저장
+                    echo "${file}:${line_num}:${line_length}:${actual_content:0:100}" >> long_lines_detail.txt
+                  fi
+                done
             fi
           done < changed_files.txt
           
           # 120자 초과 라인 총 개수 계산
-          LONG_LINES_COUNT=$(grep -c "^.*:.*:.*:.*" long_lines_detail.txt || echo "0")
+          LONG_LINES_COUNT=$(wc -l < long_lines_detail.txt | tr -d ' ')
+          [ -z "$LONG_LINES_COUNT" ] && LONG_LINES_COUNT=0
           
           echo "non_test_changed_lines=$NON_TEST_LINES" >> $GITHUB_OUTPUT
           echo "test_changed_lines=$TEST_LINES" >> $GITHUB_OUTPUT
@@ -102,6 +104,8 @@ jobs:
           echo "Long lines (>120 chars): $LONG_LINES_COUNT"
           echo "Found issue keys:"
           cat commit_issue_keys.txt || echo "None"
+          echo "=== Long Lines Details ==="
+          cat long_lines_detail.txt || echo "None"
 
       - name: Validate PR Rules
         uses: actions/github-script@v7
@@ -124,22 +128,37 @@ jobs:
             let longLinesDetails = [];
             try {
               const longLinesContent = fs.readFileSync('long_lines_detail.txt', 'utf8');
-              const lines = longLinesContent.split('\n').filter(line => line.includes(':'));
+              const lines = longLinesContent.trim().split('\n').filter(line => line.length > 0);
+            
+              console.log('Raw long lines content:', longLinesContent);
+              console.log('Parsed lines count:', lines.length);
             
               longLinesDetails = lines.map(line => {
-                const parts = line.split(':');
-                if (parts.length >= 4) {
-                  return {
-                    file: parts[0],
-                    lineNumber: parts[1],
-                    length: parseInt(parts[2]),
-                    content: parts.slice(3).join(':').substring(0, 100) // 처음 100자만
-                  };
+                const firstColon = line.indexOf(':');
+                const secondColon = line.indexOf(':', firstColon + 1);
+                const thirdColon = line.indexOf(':', secondColon + 1);
+            
+                if (firstColon === -1 || secondColon === -1 || thirdColon === -1) {
+                  console.log('Invalid line format:', line);
+                  return null;
                 }
-                return null;
+            
+                const file = line.substring(0, firstColon);
+                const lineNumber = line.substring(firstColon + 1, secondColon);
+                const length = line.substring(secondColon + 1, thirdColon);
+                const content = line.substring(thirdColon + 1);
+            
+                return {
+                  file: file,
+                  lineNumber: lineNumber,
+                  length: parseInt(length),
+                  content: content.substring(0, 80) // 처음 80자만
+                };
               }).filter(item => item !== null);
+            
+              console.log('Parsed long lines details:', longLinesDetails);
             } catch (error) {
-              console.log('No long lines detail file found');
+              console.log('Error reading long lines detail file:', error.message);
             }
             
             console.log('PR Info:', {
@@ -152,6 +171,7 @@ jobs:
               hasTests,
               commitLinkedIssues,
               longLinesCount,
+              longLinesDetailsCount: longLinesDetails.length,
               prBodyLength: prBody.length
             });
             
@@ -192,17 +212,19 @@ jobs:
             
             // 2-1. 라인 길이 검증 (120자 초과)
             const MAX_LINE_LENGTH = 120;
-            if (longLinesCount > 0) {
+            if (longLinesCount > 0 && longLinesDetails.length > 0) {
               // 상위 5개만 표시
               const topViolations = longLinesDetails.slice(0, 5);
-              let detailMessage = `다음 ${topViolations.length}개 라인이 ${MAX_LINE_LENGTH}자를 초과합니다:\n`;
+              let detailMessage = `다음 라인들이 ${MAX_LINE_LENGTH}자를 초과합니다:\n\n`;
             
               topViolations.forEach((item, index) => {
-                detailMessage += `  ${index + 1}. \`${item.file}\` 라인 ${item.lineNumber}: ${item.length}자\n`;
+                const preview = item.content.trim().substring(0, 60);
+                detailMessage += `  ${index + 1}. **\`${item.file}\`** 라인 ${item.lineNumber}: ${item.length}자\n`;
+                detailMessage += `     \`${preview}${item.content.length > 60 ? '...' : ''}\`\n\n`;
               });
             
               if (longLinesCount > 5) {
-                detailMessage += `  ... 외 ${longLinesCount - 5}개 라인\n`;
+                detailMessage += `  ... 외 ${longLinesCount - 5}개 라인`;
               }
             
               violations.push({
@@ -361,12 +383,16 @@ jobs:
             
               let detailIndex = 1;
               for (const violation of violations) {
-                validationResult += `${detailIndex}. ${violation.detail}\n`;
+                const lines = violation.detail.split('\n');
+                validationResult += `**${detailIndex}. ${lines[0]}**\n`;
+                if (lines.length > 1) {
+                  validationResult += lines.slice(1).join('\n') + '\n';
+                }
+                validationResult += '\n';
                 detailIndex++;
               }
             
-              validationResult += `
-            ---
+              validationResult += `---
             *마지막 검증: ${timestamp}*
             <!-- PR_RULE_VALIDATION_END -->`;
             
@@ -427,7 +453,3 @@ jobs:
             });
             
             console.log('PR description updated successfully');
-            console.log('Violations found:', violations.length);
-            console.log('Non-test lines:', nonTestChangedLines);
-            console.log('Test lines:', testChangedLines);
-            console.log('Long lines:', longLinesCount);
