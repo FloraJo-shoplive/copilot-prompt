@@ -31,6 +31,16 @@ jobs:
           COMMIT_COUNT=$(git rev-list --count origin/${{ github.event.pull_request.base.ref }}..origin/${{ github.event.pull_request.head.ref }})
           echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
           
+          # 커밋 메시지 수집
+          git log origin/${{ github.event.pull_request.base.ref }}..origin/${{ github.event.pull_request.head.ref }} --pretty=format:"%s%n%b" > commit_messages.txt
+          
+          # 커밋 메시지에서 이슈 키 추출 (PROD-1, CO-2, ABC-123 등)
+          COMMIT_ISSUES=$(cat commit_messages.txt | grep -oE '[A-Z]+-[0-9]+' | sort -u | wc -l)
+          echo "commit_linked_issues=$COMMIT_ISSUES" >> $GITHUB_OUTPUT
+          
+          # 추출된 이슈 키 목록 (디버깅용)
+          cat commit_messages.txt | grep -oE '[A-Z]+-[0-9]+' | sort -u > commit_issue_keys.txt || touch commit_issue_keys.txt
+          
           # 전체 변경 라인 수 계산
           git diff origin/${{ github.event.pull_request.base.ref }}...origin/${{ github.event.pull_request.head.ref }} --shortstat > diff_stat.txt
           TOTAL_CHANGED_LINES=$(awk '{print $4+$6}' diff_stat.txt)
@@ -68,6 +78,9 @@ jobs:
           echo "Non-test changed lines: $NON_TEST_LINES"
           echo "Test changed lines: $TEST_LINES"
           echo "Has test files: $([[ $TEST_FILE_COUNT -gt 0 ]] && echo 'true' || echo 'false')"
+          echo "Commit linked issues: $COMMIT_ISSUES"
+          echo "Found issue keys:"
+          cat commit_issue_keys.txt || echo "None"
 
       - name: Validate PR Rules
         uses: actions/github-script@v7
@@ -78,16 +91,20 @@ jobs:
             const nonTestChangedLines = parseInt('${{ steps.pr-info.outputs.non_test_changed_lines }}');
             const testChangedLines = parseInt('${{ steps.pr-info.outputs.test_changed_lines }}');
             const hasTests = '${{ steps.pr-info.outputs.has_tests }}' === 'true';
+            const commitLinkedIssues = parseInt('${{ steps.pr-info.outputs.commit_linked_issues }}');
             const pr = context.payload.pull_request;
             const prBody = pr.body || '';
+            const prTitle = pr.title || '';
             
             console.log('PR Info:', {
               number: pr.number,
+              title: prTitle,
               commitCount,
               totalChangedLines,
               nonTestChangedLines,
               testChangedLines,
               hasTests,
+              commitLinkedIssues,
               prBodyLength: prBody.length
             });
             
@@ -126,30 +143,64 @@ jobs:
               checks.push(`변경 라인 수: ${nonTestChangedLines}줄 (테스트 코드 없음, 최대 ${MAX_NON_TEST_LINES}줄)`);
             }
             
-            // 3. 연결된 카드/이슈 개수 검증
-            const issueMatches = prBody.match(/#\d+/g) || [];
-            const closesMatches = prBody.match(/closes\s+#\d+/gi) || [];
-            const linkedIssues = new Set([...issueMatches, ...closesMatches.map(m => m.match(/#\d+/)[0])]);
-            const linkedCount = linkedIssues.size;
+            // 3. 연결된 카드/이슈 개수 검증 (Jira 스타일: PROD-1, CO-2 등)
+            // PR Title에서 이슈 키 추출
+            const titleIssueMatches = prTitle.match(/[A-Z]+-\d+/g) || [];
+            
+            // PR Description에서 이슈 키 추출
+            const bodyIssueMatches = prBody.match(/[A-Z]+-\d+/g) || [];
+            
+            // 모든 이슈 키 합치기 (중복 제거)
+            const prLinkedIssues = new Set([...titleIssueMatches, ...bodyIssueMatches]);
+            const prLinkedCount = prLinkedIssues.size;
+            
+            // PR Description/Title과 커밋 메시지 모두 체크
+            const totalLinkedCount = prLinkedCount > 0 ? prLinkedCount : commitLinkedIssues;
+            
+            // 발견된 이슈 키 목록
+            const foundIssueKeys = Array.from(prLinkedIssues);
+            
+            console.log('Found issue keys in PR:', foundIssueKeys);
+            console.log('Found issue count in commits:', commitLinkedIssues);
             
             const MAX_LINKED = 1;
-            if (linkedCount > MAX_LINKED) {
+            const MIN_LINKED = 1;
+            
+            if (totalLinkedCount > MAX_LINKED) {
               violations.push({
                 category: 'Pull Request 크기 규칙',
-                message: `**연결된 카드 초과**: 현재 ${linkedCount}개 (최대 허용: ${MAX_LINKED}개)`,
-                detail: 'PR을 분리하여 각각 하나의 이슈에만 연결해주세요'
+                message: `**연결된 카드 초과**: 현재 ${totalLinkedCount}개 (최대 허용: ${MAX_LINKED}개)`,
+                detail: 'PR을 분리하여 각각 하나의 카드에만 연결해주세요'
               });
             }
             
-            const MIN_LINKED = 1;
-            if (linkedCount < MIN_LINKED) {
+            if (totalLinkedCount < MIN_LINKED) {
               violations.push({
-                category: 'Pull Request 크기 규칙',
-                message: `**연결된 카드 없음**: 현재 ${linkedCount}개 (최소 허용: ${MIN_LINKED}개)`,
-                detail: 'PR에 연결된 카드가 없습니다.'
+                category: 'Pull Request 연결 규칙',
+                message: `**연결된 카드 없음**: PR Title, Description 또는 커밋 메시지에 카드 번호가 없습니다`,
+                detail: 'PR Title에 "[PROD-123]" 형식으로 카드를 연결하거나, PR Description 또는 커밋 메시지에 "PROD-123" 형식으로 카드 번호를 포함해주세요'
               });
             }
-            checks.push(`연결된 카드: ${linkedCount}개 (최대 ${MAX_LINKED}개)`);
+            
+            // 연결 위치 표시
+            let linkedLocation = '';
+            let linkedDetails = [];
+            
+            if (titleIssueMatches.length > 0) {
+              linkedDetails.push(`Title: ${titleIssueMatches.join(', ')}`);
+            }
+            if (bodyIssueMatches.length > 0) {
+              linkedDetails.push(`Description: ${bodyIssueMatches.join(', ')}`);
+            }
+            if (commitLinkedIssues > 0) {
+              linkedDetails.push(`커밋 메시지: ${commitLinkedIssues}개`);
+            }
+            
+            if (linkedDetails.length > 0) {
+              linkedLocation = ` (${linkedDetails.join(', ')})`;
+            }
+            
+            checks.push(`연결된 카드: ${totalLinkedCount}개${linkedLocation} (최소 ${MIN_LINKED}개, 최대 ${MAX_LINKED}개)`);
             
             // 4. PR Description 필수 섹션 검증
             const requiredSections = [
@@ -180,7 +231,7 @@ jobs:
                   }
                 } else {
                   // 카드 링크로 대체 가능
-                  if (linkedCount === 0) {
+                  if (totalLinkedCount === 0) {
                     missingSections.push(section.name);
                   } else {
                     foundSections.push(`${section.name} (카드 링크로 대체 가능)`);
@@ -209,7 +260,7 @@ jobs:
             if (violations.length > 0) {
               // 위반 사항이 있는 경우
               validationResult = `<!-- PR_RULE_VALIDATION_START -->
-            ##  PR 규칙 검증 결과
+            ## 🤖 PR 규칙 검증 결과
             
             ### ❌ 규칙 위반 (${violations.length}개)
             
@@ -234,7 +285,7 @@ jobs:
             
               validationResult += `---
             
-            ###  위반 상세
+            ### 📋 위반 상세
             
             `;
             
@@ -309,3 +360,6 @@ jobs:
             console.log('Violations found:', violations.length);
             console.log('Non-test lines:', nonTestChangedLines);
             console.log('Test lines:', testChangedLines);
+            console.log('PR linked issues:', prLinkedCount);
+            console.log('Commit linked issues:', commitLinkedIssues);
+            console.log('Total linked issues:', totalLinkedCount);
