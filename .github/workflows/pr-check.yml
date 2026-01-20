@@ -138,7 +138,7 @@ jobs:
             // 상세 정보 표시
             if (hasTests) {
               checks.push(`변경 라인 수: ${nonTestChangedLines}줄 (테스트 코드 제외, 최대 ${MAX_NON_TEST_LINES}줄)`);
-              checks.push(`테스트 코드: ${testChangedLines}줄 (최대 ${MAX_TEST_LINES}줄, 참고용)`);
+              checks.push(`테스트 코드: ${testChangedLines}줄;
             } else {
               checks.push(`변경 라인 수: ${nonTestChangedLines}줄 (테스트 코드 없음, 최대 ${MAX_NON_TEST_LINES}줄)`);
             }
